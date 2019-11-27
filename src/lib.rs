@@ -116,10 +116,6 @@ fn parse_attlist(input: &str) -> IResult<&str, AttList> {
     ))
 }
 
-// fn parse_element_child(input: &str) -> IResult<&str, ElementChild> {
-
-// }
-
 fn optionality(ch: char) -> Optionality {
     if ch == '?' {
         Optionality::ZeroOrOne
@@ -177,19 +173,20 @@ fn parse_element_children(mut input: &str) -> IResult<&str, ElementChild> {
     let mut is_disjoint = false;
     loop {
         input = take_while(|x| x == ' ')(input)?.0;
-        let (inner_input, child) = take_while(|x| x != ',' && x != '|' && x != ')')(input)?;
+        let (mut inner_input, child) = take_while(|x| x != ',' && x != '|' && x != ')')(input)?;
 
         if child.trim() != "" {
             let (_, child) = parse_element_child(child)?;
             out.push(child);
         }
 
-        if inner_input.starts_with(")") {
+        let inner_input = if inner_input.starts_with(")") {
             let (inner_input, _) = tag(")")(inner_input)?;
             let optionality = match inner_input.chars().next() {
                 Some(ch) => optionality(ch),
                 None => Optionality::Required,
             };
+            let inner_input = take_while(|x| x == '?' || x == '*' || x == '+')(inner_input)?.0;
 
             let child = if is_disjoint {
                 ElementChild::OneOf(out, optionality)
@@ -199,11 +196,12 @@ fn parse_element_children(mut input: &str) -> IResult<&str, ElementChild> {
             return Ok((inner_input, child));
         } else if inner_input.starts_with("|") {
             is_disjoint = true;
-            let (inner_input, _) = tag("|")(inner_input)?;
-        }
+            tag("|")(inner_input)?.0
+        } else {
+            inner_input
+        };
 
-        let (inner_input, child_candidate) =
-            take_while(|x| x == '|' || x == ',' || x == ' ')(inner_input)?;
+        let (inner_input, _) = take_while(|x| x == '|' || x == ',' || x == ' ')(inner_input)?;
         if inner_input.starts_with("(") {
             let (inner_input, child) = parse_element_children(inner_input)?;
             out.push(child);
@@ -218,9 +216,10 @@ fn parse_element(input: &str) -> IResult<&str, Element> {
     let (input, _) = take_while(|x| x == ' ')(input)?;
     let (input, name) = take_until(" ")(input)?;
     let (input, _) = take_while(|x| x == ' ')(input)?;
-    // Ok((input, Element { name: name.to_string() }));
     let (input, children) = parse_element_children(input)?;
-    // unimplemented!()
+    let (input, _) = take_until(">")(input)?;
+    let (input, _) = tag(">")(input)?;
+
     Ok((
         input,
         Element {
@@ -235,23 +234,17 @@ fn start_tag(input: &str) -> IResult<&str, &str> {
 }
 
 fn parse_tag(input: &str) -> IResult<&str, Option<Tag>> {
-    // println!("OK");
     let input = match start_tag(input) {
         Ok((v, _)) => v,
         Err(_) => return Ok(("", None)),
     };
 
-    // println!("Took: {}", input);
-    let (input, _) = tag("<!")(input)?; //, take_until(">"), tag(">"))(input)?;
+    let (input, _) = tag("<!")(input)?;
     let (input, _) = take_while(|x| x == ' ')(input)?;
 
     let (input, tag_name) = alt((tag("ELEMENT"), tag("ATTLIST"), tag("--")))(input)?;
     match tag_name {
-        "ELEMENT" => {
-            let (input, body) = take_until(">")(input)?;
-            let (input, _) = tag(">")(input)?;
-            Ok((input, Some(Tag::Element(parse_element(body)?.1))))
-        }
+        "ELEMENT" => Ok((input, Some(Tag::Element(parse_element(input)?.1)))),
         "ATTLIST" => Ok((input, Some(Tag::AttList(parse_attlist(input)?.1)))),
         "--" => {
             let (input, comment) = take_until("-->")(input)?;
@@ -291,19 +284,7 @@ mod tests {
 }
 
 mod gen {
-    use super::{parse_dtd, Element, ElementChild, Optionality, Tag};
-
-    #[derive(Debug)]
-    struct XmlEnum {
-        name: String,
-        fields: Vec<XmlField>,
-    }
-
-    // enum XmlFieldTy {
-    //     Enum,
-    //     String,
-    //     Struct,
-    // }
+    use super::{parse_dtd, AttListDefault, Element, ElementChild, Optionality, Tag};
 
     #[derive(Debug)]
     struct XmlField {
@@ -313,23 +294,26 @@ mod gen {
     }
 
     #[derive(Debug)]
-    struct XmlStruct {
+    struct XmlElement {
         name: String,
+        ty: XmlTy,
         fields: Vec<XmlField>,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq)]
     enum XmlTy {
         Struct,
+        AnonStruct,
         Enum,
+        AnonEnum,
+        Attr,
     }
 
     use std::collections::HashMap;
 
     #[derive(Debug)]
     struct Gen {
-        enums: HashMap<String, XmlEnum>,
-        structs: HashMap<String, XmlStruct>,
+        elements: HashMap<String, XmlElement>,
     }
 
     impl Gen {
@@ -359,15 +343,16 @@ mod gen {
                     let mut variant = 1;
                     let mut variant_name = format!("{}_AllOf{}", name, variant);
 
-                    while self.structs.contains_key(&variant_name) {
+                    while self.elements.contains_key(&variant_name) {
                         variant += 1;
                         variant_name = format!("{}_AllOf{}", name, variant);
                     }
 
-                    self.structs.insert(
+                    self.elements.insert(
                         variant_name.clone(),
-                        XmlStruct {
+                        XmlElement {
                             name: variant_name.clone(),
+                            ty: XmlTy::AnonStruct,
                             fields: vec![],
                         },
                     );
@@ -376,12 +361,12 @@ mod gen {
                     for child in children {
                         fields.append(&mut self.process(&variant_name, child, depth + 1));
                     }
-                    self.structs.get_mut(&variant_name).unwrap().fields = fields;
+                    self.elements.get_mut(&variant_name).unwrap().fields = fields;
 
                     out.push(XmlField {
                         name: variant_name.clone(),
                         optionality,
-                        ty: XmlTy::Struct,
+                        ty: XmlTy::AnonStruct,
                     });
                 }
                 ElementChild::OneOf(children, optionality) => {
@@ -395,15 +380,16 @@ mod gen {
                     let mut variant = 1;
                     let mut variant_name = format!("{}_OneOf{}", name, variant);
 
-                    while self.enums.contains_key(&variant_name) {
+                    while self.elements.contains_key(&variant_name) {
                         variant += 1;
                         variant_name = format!("{}_OneOf{}", name, variant);
                     }
 
-                    self.enums.insert(
+                    self.elements.insert(
                         variant_name.clone(),
-                        XmlEnum {
+                        XmlElement {
                             name: variant_name.clone(),
+                            ty: XmlTy::AnonEnum,
                             fields: vec![],
                         },
                     );
@@ -412,12 +398,12 @@ mod gen {
                     for child in children {
                         fields.append(&mut self.process(&variant_name, child, depth + 1));
                     }
-                    self.enums.get_mut(&variant_name).unwrap().fields = fields;
+                    self.elements.get_mut(&variant_name).unwrap().fields = fields;
 
                     out.push(XmlField {
                         name: variant_name.clone(),
                         optionality,
-                        ty: XmlTy::Enum,
+                        ty: XmlTy::AnonEnum,
                     });
                 }
             }
@@ -427,46 +413,161 @@ mod gen {
 
         fn new() -> Gen {
             Gen {
-                enums: HashMap::new(),
-                structs: HashMap::new(),
+                elements: HashMap::new(),
+            }
+        }
+
+        fn print(&self) {
+            use heck::CamelCase;
+            use heck::SnakeCase;
+            let mut keys = self.elements.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                let element = &self.elements[key];
+                match element.ty {
+                    XmlTy::Struct | XmlTy::AnonStruct => {
+                        println!("#[derive(Debug, Serialize, Deserialize)]");
+                        println!("struct {} {{", &element.name.to_camel_case());
+                        for field in element.fields.iter() {
+                            let ty = if field.name == "#PCDATA" {
+                                "String".into()
+                            } else {
+                                match (&field.ty, &field.optionality) {
+                                    (XmlTy::Attr, Optionality::Required) => "String".into(),
+                                    (XmlTy::Attr, _) => "Option<String>".into(),
+                                    (_, Optionality::Required) => {
+                                        field.name.to_string().to_camel_case()
+                                    }
+                                    (_, Optionality::ZeroOrMore) => {
+                                        format!("Vec<{}>", &field.name.to_camel_case())
+                                    }
+                                    (_, Optionality::OneOrMore) => {
+                                        format!("Vec<{}>", &field.name.to_camel_case())
+                                    }
+                                    (_, Optionality::ZeroOrOne) => {
+                                        format!("Option<{}>", &field.name.to_camel_case())
+                                    }
+                                }
+                            };
+
+                            let name = if field.name == "#PCDATA" {
+                                println!("    #[serde(rename = \"$value\")]");
+                                "_pcdata".into()
+                            } else {
+                                match field.ty {
+                                    XmlTy::AnonStruct => {
+                                        println!("    // Generated anonymous struct")
+                                    }
+                                    XmlTy::AnonEnum => println!("    // Generated anonymous enum"),
+                                    _ => println!("    #[serde(rename = \"{}\")]", field.name),
+                                }
+                                field.name.to_snake_case()
+                            };
+                            println!("    {}: {},", name, ty);
+                        }
+                        println!("}}\n");
+                    }
+                    XmlTy::Enum | XmlTy::AnonEnum => {
+                        println!("#[derive(Debug, Serialize, Deserialize)]");
+                        println!("#[serde(untagged)]");
+                        println!("enum {} {{", &element.name.to_camel_case());
+                        for field in element.fields.iter() {
+                            let ty = if field.name == "#PCDATA" {
+                                "String".into()
+                            } else {
+                                match (&field.ty, &field.optionality) {
+                                    (XmlTy::Attr, Optionality::Required) => "String".into(),
+                                    (XmlTy::Attr, _) => "Option<String>".into(),
+                                    (_, Optionality::Required) => {
+                                        field.name.to_string().to_camel_case()
+                                    }
+                                    (_, Optionality::ZeroOrMore) => {
+                                        format!("Vec<{}>", &field.name.to_camel_case())
+                                    }
+                                    (_, Optionality::OneOrMore) => {
+                                        format!("Vec<{}>", &field.name.to_camel_case())
+                                    }
+                                    (_, Optionality::ZeroOrOne) => {
+                                        format!("Option<{}>", &field.name.to_camel_case())
+                                    }
+                                }
+                            };
+                            let name = if field.name == "#PCDATA" {
+                                println!("    #[serde(rename = \"$value\")]");
+                                "_pcdata".into()
+                            } else {
+                                match field.ty {
+                                    XmlTy::AnonStruct => {
+                                        println!("    // Generated anonymous struct")
+                                    }
+                                    XmlTy::AnonEnum => println!("    // Generated anonymous enum"),
+                                    _ => println!("    #[serde(rename = \"{}\")]", field.name),
+                                }
+                                field.name.to_camel_case()
+                            };
+                            println!("    {}({}),", &name, &ty);
+                        }
+                        println!("}}\n");
+                    }
+                    _ => {}
+                }
             }
         }
 
         fn generate(&mut self, tags: Vec<Tag>) {
-            self.enums = HashMap::new();
-            self.structs = HashMap::new();
+            self.elements = HashMap::new();
 
             for tag in tags {
                 match tag {
-                    Tag::Element(element) => {
-                        match element.children {
-                            ElementChild::AllOf(_, _) => {
-                                let fields = self.process(&element.name, element.children, 0);
-                                self.structs.insert(
-                                    element.name.clone(),
-                                    XmlStruct {
-                                        name: element.name.clone(),
-                                        fields
-                                    },
-                                );
-                            },
-                            ElementChild::OneOf(_, _) => {
-                                let fields = self.process(&element.name, element.children, 0);
-                                self.enums.insert(
-                                    element.name.clone(),
-                                    XmlEnum {
-                                        name: element.name.clone(),
-                                        fields
-                                    },
-                                );
-                            },
-                            _ => {}
-                            // e => { panic!("impossible: {:?}", e) }
-                        }
-                    }
                     Tag::AttList(attlist) => {
-                        // attlist.element_name
+                        let element = match self.elements.get_mut(&attlist.element_name) {
+                            Some(v) => v,
+                            None => panic!("No element: {}", &attlist.element_name),
+                        };
+                        element.fields.push(XmlField {
+                            name: attlist.name,
+                            ty: XmlTy::Attr,
+                            optionality: match attlist.default {
+                                AttListDefault::Required => Optionality::Required,
+                                _ => Optionality::ZeroOrMore,
+                            },
+                        });
                     }
+                    Tag::Element(element) => match element.children {
+                        ElementChild::Empty | ElementChild::Any => {
+                            self.elements.insert(
+                                element.name.clone(),
+                                XmlElement {
+                                    name: element.name.clone(),
+                                    ty: XmlTy::Struct,
+                                    fields: vec![],
+                                },
+                            );
+                        }
+                        ElementChild::AllOf(_, _) => {
+                            let fields = self.process(&element.name, element.children, 0);
+                            self.elements.insert(
+                                element.name.clone(),
+                                XmlElement {
+                                    name: element.name.clone(),
+                                    ty: XmlTy::Struct,
+                                    fields,
+                                },
+                            );
+                        }
+                        ElementChild::OneOf(_, _) => {
+                            let fields = self.process(&element.name, element.children, 0);
+                            self.elements.insert(
+                                element.name.clone(),
+                                XmlElement {
+                                    name: element.name.clone(),
+                                    ty: XmlTy::Enum,
+                                    fields,
+                                },
+                            );
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -478,7 +579,8 @@ mod gen {
     fn test() {
         let mut g = Gen::new();
         let tags = parse_dtd(include_str!("../ldml.dtd")).unwrap();
+        println!("{:#?}", tags);
         g.generate(tags);
-        println!("{:#?}", g);
+        g.print();
     }
 }
