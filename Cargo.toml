@@ -1,5 +1,6 @@
 [package]
 name = "dtd"
+description = "A parser for XML DTD files"
 version = "0.1.0"
 authors = ["Brendan Molloy <brendan@bbqsrc.net>"]
 license = "Apache-2.0 OR MIT"
